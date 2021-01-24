@@ -1,5 +1,7 @@
 # Aida-Gym training environment
 
+Authors : Ivan Blanc, Arnaud Chol, Philippine Cordelle, Théodore Otzenberger, Axel Rousselot
+
 This is a fork from Aida Gym environment created in order to create tools to make Aida robot learn to walk.
 We implemented Stable-baselines support in order to use their proven-to-work algorythms.
 So far we didn't manage to make the robot walk in a decent manner, try it yourself and let us know if you can.
