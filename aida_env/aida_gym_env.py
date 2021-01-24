@@ -20,10 +20,10 @@ MOTOR_TORQUE_OBSERVATION_INDEX = MOTOR_VELOCITY_OBSERVATION_INDEX + NUM_MOTORS
 BASE_ORIENTATION_OBSERVATION_INDEX = MOTOR_TORQUE_OBSERVATION_INDEX + NUM_MOTORS
 ACTION_EPS = 0.01
 OBSERVATION_EPS = 0.01
-RENDER_HEIGHT = 720
-RENDER_WIDTH = 960
+RENDER_HEIGHT = 360
+RENDER_WIDTH = 480
 
-
+    
 class AidaBulletEnv(gym.Env):
   """The gym environment for aida.
   It simulates the locomotion of aida, a quadruped robot. The state space
@@ -38,18 +38,20 @@ class AidaBulletEnv(gym.Env):
   }
   def __init__(self,
                commands,   ##(position) commands is an array of [x,y] position
-			   ##(velocity) commands is an array of [duration,[vx,vy,vz,ax,ay,az]]
-               commandtype="velocity",
-	       area = "plane",
+               ##(velocity) commands is an array of [duration,[vx,vy,vz,ax,ay,az]]
+               commandtype="position",
+               area = "plane",
                urdf_root=pybullet_data.getDataPath(),
                action_repeat=1,
-               distance_weight=200,
-               energy_weight=0.5,
-               shake_weight=10,
-               drift_weight=10,
                height_weight=100,
-               curve_weight=10,
-	       type_weight = 200,
+               default_reward = 1.0,
+               orientation_weight = 1.0,
+               direction_weight = 1.0,
+               speed_weight = 1.0,
+               mimic_weight = 20.0,
+               type_weight = 10,
+               consistancy_weight = 5,
+               logReward = False,
                distance_limit=float("inf"),
                observation_noise_stdev=0.0,
                self_collision_enabled=True,
@@ -64,7 +66,8 @@ class AidaBulletEnv(gym.Env):
                hard_reset=True,
                on_rack=False,
                render=False,
-               kd_for_pd_controllers=0.3):
+               kd_for_pd_controllers=0.3, 
+	       duck=False):
                #env_randomizer=aida_env_randomizer.aidaEnvRandomizer()):
     """Initialize aida gym environment.
     Args:
@@ -112,13 +115,9 @@ class AidaBulletEnv(gym.Env):
     self._observation = []
     self._env_step_counter = 0
     self._is_render = render
+    self._duck = duck
     self._last_base_position = [0, 0, 0]
-    self._distance_weight = distance_weight
-    self._energy_weight = energy_weight
-    self._drift_weight = drift_weight
     self._height_weight = height_weight
-    self._shake_weight = shake_weight
-    self._curve_weight = curve_weight
     self._type_weight = type_weight
     self._distance_limit = distance_limit
     self._observation_noise_stdev = observation_noise_stdev
@@ -140,8 +139,29 @@ class AidaBulletEnv(gym.Env):
     self._commands = commands
     self._commandtype = commandtype
     self._area = area
-
-    print("urdf_root=" + self._urdf_root)
+    self._default_reward = default_reward
+    self._currentObjective = 0
+    self._orientation_weight = orientation_weight
+    self._direction_weight = direction_weight
+    self._speed_weight = speed_weight
+    self._mimic_weight = mimic_weight
+    self._consistancy_weight = consistancy_weight
+    self._rewardLineID = -1
+    self._shapeID = -1
+    self._t = 0
+    self._last_action = np.array([0,0,0,0,0,0,0,0,0,0,0,0])
+    self._new_action = np.array([0,0,0,0,0,0,0,0,0,0,0,0])
+    self._logRewardTab = []
+    self._logReward = logReward
+    
+    self._height_forgiveness = 0.007
+    self._orientation_forgiveness = 0.005
+    self._speed_forgiveness = 4
+    self._direction_forgiveness = 0.5
+    self._mimic_forgiveness = 3
+    
+    self._ideal_speed = 0.05
+    
     #self._env_randomizer = env_randomizer
     # PD control needs smaller time step for stability.
     if pd_control_enabled or accurate_motor_model_enabled:
@@ -154,7 +174,7 @@ class AidaBulletEnv(gym.Env):
           connection_mode=pybullet.GUI)
     else:
       self._pybullet_client = bullet_client.BulletClient()
-
+    
     self._seed()
     self.reset()
     observation_high = (
@@ -168,6 +188,7 @@ class AidaBulletEnv(gym.Env):
     self.viewer = None
     self._hard_reset = hard_reset  # This assignment need to be after reset()
     self.render = self._render
+    self.duck = self._duck
     self.step = self._step
 
  # def set_env_randomizer(self, env_randomizer):
@@ -177,7 +198,7 @@ class AidaBulletEnv(gym.Env):
     self._args = args
 
   def reset(self):
-      self._reset()
+      return self._reset()
 
   def get_commands(self):
       return self._commands
@@ -189,8 +210,7 @@ class AidaBulletEnv(gym.Env):
           numSolverIterations=int(self._num_bullet_solver_iterations))
       self._pybullet_client.setTimeStep(self._time_step)
       path = aida.getDataPath() + "/urdf/" + self._area +".urdf"
-      print(path)
-      print("%s/" % self._urdf_root + self._area +".urdf" )
+
       self._pybullet_client.loadURDF(path)
       #self._pybullet_client.loadURDF("%s/plane.urdf" % self._urdf_root)
 
@@ -217,7 +237,6 @@ class AidaBulletEnv(gym.Env):
 
     self._env_step_counter = 0
     self._last_base_position = [0, 0, 0]
-    self._objectives = []
     self._pybullet_client.resetDebugVisualizerCamera(
         self._cam_dist, self._cam_yaw, self._cam_pitch, [0, 0, 0])
     if not self._torque_control_enabled:
@@ -225,7 +244,17 @@ class AidaBulletEnv(gym.Env):
         if self._pd_control_enabled or self._accurate_motor_model_enabled:
           self.aida.ApplyAction(-0.5 * np.ones(12))
         self._pybullet_client.stepSimulation()
-    return self._noisy_observation()
+    ret = self._noisy_observation()
+    self._currentObjective = 0
+    self.aida.setTarget(self._commands[self._currentObjective])
+    if(self._is_render):
+        pybullet.removeUserDebugItem(self._shapeID)
+        self._shapeID = pybullet.addUserDebugLine(self._commands[self._currentObjective]+[0],self._commands[self._currentObjective]+[1],lineColorRGB=[0,1,0.5], lineWidth=10)
+    for i in range(50):
+        self._step([0.0, -0.85, 0.5, 0.0, -0.85, 0.5, 0, -0.45, 0.5, 0, -0.45, 0.5])  # init
+    self._t = 0
+    self._logRewardTab = []
+    return ret
 
   def _seed(self, seed=None):
     self.np_random, seed = seeding.np_random(seed)
@@ -254,6 +283,30 @@ class AidaBulletEnv(gym.Env):
       ValueError: The action dimension is not the same as the number of motors.
       ValueError: The magnitude of actions is out of bounds.
     """
+    if(np.random.random_sample() > 0.99 and self._duck == True):
+        position = self.aida.GetBasePosition()
+        shift = [0, -0.02, 0]
+        size=random.uniform(0.015, 0.04)
+        mass=random.uniform(5, 20)
+        meshScale = [size, size, size]
+        #the visual shape and collision shape can be re-used by all createMultiBody instances (instancing)
+        visualShapeId = pybullet.createVisualShape(shapeType=pybullet.GEOM_MESH,
+                                    fileName="duck.obj",
+                                    rgbaColor=[1, 1, 1, 1],
+                                    specularColor=[0.4, .4, 0],
+                                    visualFramePosition=shift,
+                                    meshScale=meshScale)
+        collisionShapeId = pybullet.createCollisionShape(shapeType=pybullet.GEOM_MESH,
+                                          fileName="duck.obj",
+                                          collisionFramePosition=shift,
+                                          meshScale=meshScale)
+        pybullet.createMultiBody(baseMass=mass,
+                      baseInertialFramePosition=[0, 0, 0],
+                      baseCollisionShapeIndex=collisionShapeId,
+                      baseVisualShapeIndex=visualShapeId,
+                      basePosition=[position[0],
+                                    position[1], position[2]+1],
+                      useMaximalCoordinates=True)
     if self._is_render:
       # Sleep, otherwise the computation takes less time than real time,
       # which will make the visualization like a fast-forward video.
@@ -269,10 +322,15 @@ class AidaBulletEnv(gym.Env):
     for _ in range(self._action_repeat):
       self.aida.ApplyAction(action)
       self._pybullet_client.stepSimulation()
-
-    self._env_step_counter += 1
+    
+    
+    self._new_action = np.copy(action)
     reward = self._reward()
+    self._last_action = np.copy(self._new_action)
+    self._env_step_counter += 1
+    
     done = self._termination()
+    
     return np.array(self._noisy_observation()), reward, done, {}
 
   def _render(self, mode="rgb_array", close=False):
@@ -343,57 +401,111 @@ class AidaBulletEnv(gym.Env):
     local_up = rot_mat[6:]
     pos = self.aida.GetBasePosition()
     return (np.dot(np.asarray([0, 0, 1]), np.asarray(local_up)) < 0.85 or
-            pos[2] < 0.13)
-
+            pos[2] < 0.13 or self._t > 3000)
+    
   def _termination(self):
     position = self.aida.GetBasePosition()
     distance = math.sqrt(position[0]**2 + position[1]**2)
     return self.is_fallen() or distance > self._distance_limit
 
   def _reward(self):
+    self._t += 1
     current_base_position = self.aida.GetBasePosition()
-    forward_reward = current_base_position[0] - self._last_base_position[0]
-    drift_reward = -abs(current_base_position[1] - self._last_base_position[1])
-    shake_reward = -abs(current_base_position[2] - self._last_base_position[2])
-    if current_base_position[2] > 0.9:
-      height_reward = 1
-    else:
-      height_reward = 0
-    if self._commandtype =="velocity":
-        k=0
-        while self.get_commands()[k][0]<self._time_step :
-            k+=1
-        goal_velocity = self.get_commands()[k][1]
-	current_base_velocity = np.concatenate((self.aida.GetBaseLinearVelocity(),self.aida.GetBaseAngularVelocity()))
-        type_reward = - np.linalg.norm(goal_velocity - current_base_velocity)
-    elif self._commandtype =="position" :
-        type_reward= - min(np.linalg.norm(np.array(current_base_position)[0:2] - self.get_commands()[i]) for i in range (len(self.get_commands())))   ##To be optimised with Shapely
-    self._last_base_position = current_base_position
-    energy_reward = np.abs(
-        np.dot(self.aida.GetMotorTorques(),
-               self.aida.GetMotorVelocities())) * self._time_step
-    reward = (
-        self._distance_weight * forward_reward -
-        self._energy_weight * energy_reward + self._drift_weight * drift_reward
-        + self._shake_weight * shake_reward + self._height_weight * height_reward
-        + self._type_weight * type_reward)
+    distToTarget = self.aida.distToTarget()
+    if(np.linalg.norm(distToTarget) < 0.4):
+        self._currentObjective = (self._currentObjective+1)%len(self._commands)
 
-    self._objectives.append(
-        [forward_reward, energy_reward, drift_reward, shake_reward, height_reward, type_reward])
+        self.aida.setTarget(self._commands[self._currentObjective])
+        if(self._is_render):
+            pybullet.removeUserDebugItem(self._shapeID)
+            self._shapeID = pybullet.addUserDebugLine(self._commands[self._currentObjective]+[0],self._commands[self._currentObjective]+[1],lineColorRGB=[0,1,0.5], lineWidth=10)
+        #if(self._is_render):
+            #self.drawTarget(self.aida._targetPoint)
+    
+    
+    height_reward = np.exp(-((current_base_position[2]-0.7)**2)/self._height_forgiveness)
+    
+    orientation = self.aida.GetBaseOrientation()
+    rot_mat = self._pybullet_client.getMatrixFromQuaternion(orientation)
+    local_up = rot_mat[6:]
+    orientation_reward = np.exp(-((np.dot(np.asarray([0, 0, 1]), np.asarray(local_up))-1)**2)/self._orientation_forgiveness)
+    
+    dirTo = distToTarget 
+    dirTo /= np.linalg.norm(dirTo)
+    actualDir = rot_mat[:2]
+    actualDir /= np.linalg.norm(actualDir)
+    direction_reward = np.exp(-((np.dot(actualDir, -dirTo)-1)**2)/self._direction_forgiveness)
+    x = np.dot(np.array(self.aida.GetBaseLinearVelocity()[0:2]),dirTo)
+    speed_reward = np.arctan(self._speed_forgiveness*x)/np.pi*2
+
+    t = self._t
+    speed=self._ideal_speed
+    offset = np.pi
+    actions_unsync = [np.sin(t * speed + offset-np.pi)*0.3, -0.65+ np.cos(t * speed + offset) *0.2, 0.5]
+    offset = 0
+    actions = [np.sin(t * speed + offset-np.pi)*0.4, -0.75+ np.cos(t * speed + offset) *0.2, 0.5]
+    targetPos = actions_unsync + actions_unsync + actions + actions
+    realPos = self._get_observation()[0:12]
+    
+    diff = np.linalg.norm(np.array(realPos)-np.array(targetPos))
+    #rewardDiff = np.exp(-self._mimic_forgiveness*diff)
+    #rewardDiff = 1-diff/self._mimic_forgiveness
+    rewardDiff = (1-np.power((diff/2),0.4))*self._mimic_forgiveness
+    rewardDivider = self._mimic_weight +self._height_weight+self._orientation_weight+self._direction_weight+self._speed_weight
+			   
+    reward =( self._mimic_weight/rewardDivider*       rewardDiff + 
+              self._height_weight/rewardDivider*      height_reward + 
+              self._orientation_weight/rewardDivider* orientation_reward + 
+              self._direction_weight/rewardDivider*   direction_reward + 
+              self._speed_weight/rewardDivider*       speed_reward)
+
+    if(self._termination()):
+	    reward = -10
+    #pybullet.removeUserDebugItem(self._rewardLineID)
+    #self._rewardLineID = pybullet.addUserDebugLine([0,0,0],[0,0,reward],lineColorRGB=[0.5,1,0], lineWidth=10)
+    self._logRewardTab+=[[height_reward,orientation_reward,direction_reward,speed_reward,rewardDiff,reward]]
+   
     return reward
 
-  def get_objectives(self):
-    return self._objectives
+  def _get_rewardLog(self):
+      return np.mean(self._logRewardTab, axis=0)
 
+  def _get_LastrewardLog(self):
+      return self._logRewardTab[-1]
+  
+  def _get_rewardLogNames(self):
+    return ["height_reward","orientation_reward","direction_reward","speed_reward","mimic_reward","reward"]
+  
   def _get_observation(self):
     self._observation = self.aida.GetObservation()
     return self._observation
 
   def _noisy_observation(self):
     self._get_observation()
-    observation = np.array(self._observation)
+    observation = self._observation
+    observation = np.array(observation)
     if self._observation_noise_stdev > 0:
       observation += (np.random.normal(
           scale=self._observation_noise_stdev, size=observation.shape) *
                       self.aida.GetObservationUpperBound())
+
     return observation
+
+  def _send_config(self):
+
+    names = ["_height_forgiveness","_height_weight",
+    "_orientation_forgiveness","_orientation_weight",
+    "_direction_forgiveness","_direction_weight",
+    "_mimic_forgiveness","_mimic_weight",
+    "_speed_forgiveness","_speed_weight","_ideal_speed"]
+    
+    values = [self._height_forgiveness,self._height_weight,
+    self._orientation_forgiveness,self._orientation_weight,
+    self._direction_forgiveness,self._direction_weight,
+    self._mimic_forgiveness,self._mimic_weight,
+    self._speed_forgiveness,self._speed_weight,self._ideal_speed]
+
+    return [names, values]
+        
+
+        
